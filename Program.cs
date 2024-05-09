@@ -273,7 +273,7 @@ class Program
         timeout.AddAlias("-t");
         var rootCommand = new RootCommand
         (
-            "Crawls a list of domains from a newline separated file and reports back some very basic info about each."
+            "Crawls a list of domains read from stdin and reports back some very basic info about each."
         );
         rootCommand.AddOption(outputPath);
         rootCommand.AddOption(dataPath);
