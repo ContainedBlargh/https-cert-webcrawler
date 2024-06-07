@@ -14,7 +14,7 @@ class Program
         .WriteTo
         .File("log.txt", outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fff} [{Level:u3}] {Message:lj}{NewLine}{Exception}")
         .CreateLogger();
-    
+
     private static readonly object ProgressBarLock = new();
     private static ProgressBar? _progressBar;
 
@@ -37,18 +37,20 @@ class Program
 
     private static readonly Channel<DomainData> DataChannel = Channel.CreateUnbounded<DomainData>();
 
-    private static readonly int WorkersCount = Math.Min(1, Environment.ProcessorCount);
+    private static readonly int WorkersCount = Environment.ProcessorCount * 16;
 
     // When all the channels are done writing, this barrier will make sure that they are 
     private static readonly Barrier CloseDataChannelBarrier = new(WorkersCount, _ => DataChannel.Writer.Complete());
 
     private static readonly Channel<string> DomainChannel = Channel.CreateUnbounded<string>();
 
+    private static DateTime _start = DateTime.Now;
     private static int _processed;
+
     static async Task PersistenceWorker(FileInfo? redirectedOut)
     {
         var reader = DataChannel.Reader;
-        using var stream = redirectedOut?.OpenWrite() ?? Console.OpenStandardOutput();
+        using var stream = redirectedOut?.Open(FileMode.Append) ?? Console.OpenStandardOutput();
         using var writer = new StreamWriter(stream);
         writer.AutoFlush = true;
         try
@@ -62,7 +64,15 @@ class Program
                     _processed++;
                     lock (ProgressBarLock)
                     {
-                        _progressBar?.Tick(_processed);
+                        if (_progressBar != null)
+                        {
+                            var elapsed = DateTime.Now - _start;
+                            double rate = _processed / elapsed.TotalMilliseconds;
+                            double remaining = _progressBar.MaxTicks - _processed;
+                            double timeRemaining = remaining / rate;
+                            _progressBar.Tick(_processed, $"Processed {_progressBar.CurrentTick} / {_progressBar.MaxTicks} ({rate * 1000:F2} req/s)");
+                            _progressBar.EstimatedDuration = TimeSpan.FromMilliseconds(timeRemaining);
+                        }
                     }
                 }
             }
@@ -159,13 +169,15 @@ class Program
 
     static async Task DomainWorker(int timeoutSeconds)
     {
+
         var handler = new HttpClientHandler();
-        var certChannel = Channel.CreateBounded<X509Certificate2?>(1); 
-        handler.ServerCertificateCustomValidationCallback = (_, cert, _, _) => {
+        var certChannel = Channel.CreateBounded<X509Certificate2?>(1);
+        handler.ServerCertificateCustomValidationCallback = (_, cert, _, _) =>
+        {
             certChannel.Writer.TryWrite(cert);
             return true;
         };
-        
+
         using var client = new HttpClient(handler);
         client.Timeout = TimeSpan.FromSeconds(timeoutSeconds);
         var reader = DomainChannel.Reader;
@@ -176,6 +188,7 @@ class Program
             {
                 while (reader.TryRead(out var domain))
                 {
+                    var start = DateTime.Now;
                     var noPrefixHttpsData = await TryHttpsRequestAsync(client, certChannel, "", domain);
                     if (noPrefixHttpsData != null)
                     {
@@ -205,8 +218,10 @@ class Program
                     {
                         await writer.WriteAsync(wwwPrefixHttpData);
                         Logger.Information("Found information about '{domain}' using {transport} and prefix '{prefix}'", domain, "http", "www");
+                        continue;
                     }
                     Logger.Error(exception: null, "Could not gather any information about '{domain}'", domain);
+                    await writer.WriteAsync(new DomainData(domain, null, null, []));
                 }
             }
         }
@@ -221,14 +236,41 @@ class Program
         }
     }
 
+    static async Task<HashSet<string>> GetProcessedDomains(FileInfo? redirectedOut)
+    {
+        var existingDomains = new HashSet<string>();
+        if (redirectedOut != null && redirectedOut.Exists)
+        {
+            using var stream = redirectedOut.OpenRead();
+            using var streamReader = new StreamReader(stream);
+            while (await streamReader.ReadLineAsync() is { } line)
+            {
+                try
+                {
+                    var domainData = JsonSerializer.Deserialize<DomainData?>(line);
+                    if (domainData == null) continue;
+                    existingDomains.Add(domainData.Domain);
+                }
+                catch { }
+            }
+        }
+        return existingDomains;
+    }
+
     static async Task Run(FileInfo? redirectedIn, FileInfo? redirectedOut, int timeoutSeconds)
     {
+        var processedDomains = await GetProcessedDomains(redirectedOut);
+        if (processedDomains.Any())
+        {
+            Logger.Information($"Skipping {processedDomains.Count} already checked domains.");
+        }
+        
+        var persistenceWorker = new Thread(async () => await PersistenceWorker(redirectedOut));
+        persistenceWorker.Start();
         var domainWorkers = Enumerable
             .Range(0, WorkersCount)
             .Select(_ => Task.Run(() => DomainWorker(timeoutSeconds)))
             .ToArray();
-        
-        var persistenceWorker = Task.Run(() => PersistenceWorker(redirectedOut));
 
         var input = redirectedIn?.OpenRead() ?? Console.OpenStandardInput();
         using var streamReader = new StreamReader(input);
@@ -237,21 +279,28 @@ class Program
         var total = 0;
         while (await streamReader.ReadLineAsync() is { } line)
         {
-            total++;
             var trimmed = line.Trim();
-            if (string.IsNullOrWhiteSpace(trimmed)) break;
+            if (processedDomains.Contains(trimmed)) continue;
+            if (string.IsNullOrWhiteSpace(trimmed)) continue;
             await channelWriter.WriteAsync(trimmed);
+            total++;
         }
 
         channelWriter.Complete();
         await Console.Error.WriteLineAsync($"Counted {total} domains to crawl.");
         lock (ProgressBarLock)
         {
-            _progressBar = redirectedOut == null ? null : new ProgressBar(total, "Saving domain data...");
+            _progressBar = redirectedOut == null ? null : new ProgressBar
+            (
+                total,
+                "Saving domain data...",
+                new ProgressBarOptions { ShowEstimatedDuration = true }
+            );
+            _progressBar!.EstimatedDuration = TimeSpan.FromMilliseconds(total * 500);
         }
 
         await Task.WhenAll(domainWorkers);
-        await persistenceWorker;
+        persistenceWorker.Join();
         if (_progressBar != null)
         {
             _progressBar.WriteErrorLine($"Succesfully crawled {_processed}/{total} domains.");
